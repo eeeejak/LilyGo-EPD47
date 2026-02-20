@@ -47,9 +47,9 @@
 
 #define DBG_OUTPUT_PORT Serial
 
-const char *ssid = "Artemis_2.4GEXT";
-const char *password = "19E6942496D6";
-const char *host = "lilygo";
+const char *ssid = "MAIS_BA";
+const char *password = "charlotte78";
+const char *host = "t5";
 
 WebServer server(80);
 static bool hasFILE_SYSTEM = false;

@@ -31,9 +31,9 @@ const uint16_t HA_PORT = HA_PORT_NUM;
 const char* HA_TOKEN = HA_TOKEN_VALUE;
 
 // HA entities we created
-const char* ENTITY_LINE1 = "sensor.desk_calendar_line_1";
-const char* ENTITY_LINE2 = "sensor.desk_calendar_line_2";
-const char* ENTITY_CLOCK = "sensor.desk_clock_line";
+const char* ENTITY_LINE1 = "sensor.time"; // "sensor.desk_calendar_line_1";
+const char* ENTITY_LINE2 = "sensor.time"; // "sensor.desk_calendar_line_2";
+const char* ENTITY_CLOCK = "sensor.time"; // "sensor.desk_clock_line";
 
 // Update intervals (ms)
 const unsigned long CAL_UPDATE_INTERVAL_MS = 60UL * 60UL * 1000UL; // 1 hour
@@ -56,7 +56,7 @@ const Rect_t line2Area = {
 const Rect_t clockArea = {
     .x = 0,
     .y = 330,      // adjust as needed
-    .width = 960,
+    .width = 100,
     .height = 51,
 };
 
