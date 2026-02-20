@@ -1,250 +1,172 @@
-/**
- * @copyright Copyright (c) 2024  Shenzhen Xin Yuan Electronic Technology Co., Ltd
- * @date      2024-04-05
- * @note      Arduino Setting
- *            Tools ->
- *                  Board:"ESP32S3 Dev Module"
- *                  USB CDC On Boot:"Enable"
- *                  USB DFU On Boot:"Disable"
- *                  Flash Size : "16MB(128Mb)"
- *                  Flash Mode"QIO 80MHz
- *                  Partition Scheme:"16M Flash(3M APP/9.9MB FATFS)"
- *                  PSRAM:"OPI PSRAM"
- *                  Upload Mode:"UART0/Hardware CDC"
- *                  USB Mode:"Hardware CDC and JTAG"
- *
- */
-
 #ifndef BOARD_HAS_PSRAM
-#error "Please enable PSRAM, Arduino IDE -> tools -> PSRAM -> OPI !!!"
+#error "Please enable PSRAM: Arduino IDE -> Tools -> PSRAM -> OPI PSRAM"
 #endif
 
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <Arduino.h>
-#include <esp_task_wdt.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "epd_driver.h"
-#include "logo.h"
-#include "firasans.h"
 #include <Wire.h>
-#include "lilygo.h"
-#include <TouchDrvGT911.hpp>  //Arduino IDE -> Library manager -> Install SensorLib v0.19 
-#include "utilities.h"
-#include "hal/gpio_types.h"
+#include "epd_driver.h"
+#include "firasans.h"
+#include "secrets.h" 
+#include <TouchDrvGT911.hpp> // Installer "SensorLib" via le gestionnaire de bibliothèques
+#include "utilities.h"       // Nécessaire pour les pins BOARD_SDA, BOARD_SCL du S3
 
+// ---------- CONFIG ----------
+#define GRID_COLS 4
+#define GRID_ROWS 4
+#define SCREEN_WIDTH  960
+#define SCREEN_HEIGHT 540
+#define MARGIN 10
+
+uint8_t *framebuffer;
 TouchDrvGT911 touch;
-uint8_t *framebuffer = NULL;
+unsigned long lastUpdate = 0;
+const unsigned long UPDATE_INTERVAL = 5UL * 60UL * 1000UL;
 
-const char overview[] = {
-    "   ESP32 is a single 2.4 GHz Wi-Fi-and-Bluetooth\n"\
-    "combo chip designed with the TSMC ultra-low-po\n"\
-    "wer 40 nm technology. It is designed to achieve \n"\
-    "the best power and RF performance, showing rob\n"\
-    "ustness versatility and reliability in a wide variet\n"\
-    "y of applications and power scenarios.\n"\
+struct Sensor {
+    const char* title;
+    const char* state_entity;   // Entité pour lire l'état
+    const char* action_service; // Service HA (ex: "switch/toggle", "light/toggle", "button/press")
+    const char* action_entity;  // Entité à commander (si différente)
 };
 
-const char mcu_features[] = {
-    "➸ Xtensa® dual-core 32-bit LX6 microprocessor\n"\
-    "➸ 448 KB ROM & External 16MBytes falsh\n"\
-    "➸ 520 KB SRAM & External 16MBytes PSRAM\n"\
-    "➸ 16 KB SRAM in RTC\n"\
-    "➸ Multi-connections in Classic BT and BLE\n"\
-    "➸ 802.11 n (2.4 GHz), up to 150 Mbps\n"\
+// LISTE DES 16 CASES (Configurables)
+Sensor sensors[16] = {
+    {"Salon", "sensor.temp_salon", "switch/toggle", "switch.lumiere_salon"},
+    {"Bureau", "sensor.temp_bureau", "light/toggle", "light.bureau"},
+    {"Vent", "sensor.wind_speed", "button/press", "button.update_weather"},
+    {"Volet", "sensor.v_position", "cover/stop", "cover.volet_salon"},
+    // ... Complétez les 16 cases sur le même modèle ...
+    {"Update", "sensor.time", "homeassistant/update_entity", "sensor.time"},
+    {"Test 6", "sensor.time", "", ""}, {"Test 7", "sensor.time", "", ""}, {"Test 8", "sensor.time", "", ""},
+    {"Test 9", "sensor.time", "", ""}, {"Test 10", "sensor.time", "", ""}, {"Test 11", "sensor.time", "", ""}, {"Test 12", "sensor.time", "", ""},
+    {"Test 13", "sensor.time", "", ""}, {"Test 14", "sensor.time", "", ""}, {"Test 15", "sensor.time", "", ""}, {"OFF", "sensor.time", "script/turn_on", "script.all_off"}
 };
 
-const char srceen_features[] = {
-    "➸ 16 color grayscale\n"\
-    "➸ Use with 4.7\" EPDs\n"\
-    "➸ High-quality font rendering\n"\
-    "➸ ~630ms for full frame draw\n"\
-};
+// ---------- FONCTIONS HOME ASSISTANT ----------
 
+void sendHAAction(int index) {
+    if (strlen(sensors[index].action_service) == 0) return;
+    
+    HTTPClient http;
+    String url = String("http://") + HA_HOST_ADDR + ":" + HA_PORT_NUM + "/api/services/" + sensors[index].action_service;
+    
+    http.begin(url);
+    http.addHeader("Authorization", String("Bearer ") + HA_TOKEN_VALUE);
+    http.addHeader("Content-Type", "application/json");
 
-// const char *string_array[] = {overview, mcu_features, srceen_features};
+    String payload = "{\"entity_id\":\"" + String(sensors[index].action_entity) + "\"}";
+    int httpCode = http.POST(payload);
+    Serial.printf("[HA] Action %s sur %s -> Code: %d\n", sensors[index].action_service, sensors[index].action_entity, httpCode);
+    http.end();
+}
 
-int32_t cursor_x = 20;
-int32_t cursor_y = 60;
+String fetchSensorState(const char* entity_id) {
+    HTTPClient http;
+    String url = String("http://") + HA_HOST_ADDR + ":" + HA_PORT_NUM + "/api/states/" + entity_id;
+    http.begin(url);
+    http.addHeader("Authorization", String("Bearer ") + HA_TOKEN_VALUE);
+    
+    int httpCode = http.GET();
+    if (httpCode != 200) { http.end(); return "Err"; }
+    
+    JsonDocument doc;
+    deserializeJson(doc, http.getString());
+    http.end();
+    return doc["state"].as<String>();
+}
 
-Rect_t area1 = {
-    .x = 10,
-    .y = 20,
-    .width = EPD_WIDTH - 20,
-    .height =  EPD_HEIGHT / 2 + 80
-};
-uint8_t state = 1;
-uint32_t touch_loop_interval = 0;
+// ---------- DESSIN ----------
 
-void setup()
-{
-    Serial.begin(115200);
+void drawCell(int index, String state, bool inverted = false) {
+    int cellW = SCREEN_WIDTH / GRID_COLS;
+    int cellH = SCREEN_HEIGHT / GRID_ROWS;
+    int x = (index % GRID_COLS) * cellW + (MARGIN/2);
+    int y = (index / GRID_COLS) * cellH + (MARGIN/2);
+    int w = cellW - MARGIN;
+    int h = cellH - MARGIN;
 
+    uint8_t bgColor = inverted ? 0 : 255; // 0 = Noir, 255 = Blanc (approximatif)
+    uint8_t fgColor = inverted ? 255 : 0;
 
-    framebuffer = (uint8_t *)ps_calloc(sizeof(uint8_t), EPD_WIDTH * EPD_HEIGHT / 2);
-    if (!framebuffer) {
-        Serial.println("alloc memory failed !!!");
-        while (1);
-    }
+    // Fond de la case
+    Rect_t area = { .x = x, .y = y, .width = (uint32_t)w, .height = (uint32_t)h };
+    epd_fill_rect(x, y, w, h, bgColor, framebuffer);
+    epd_draw_rect(x, y, w, h, 0, framebuffer); // Bordure toujours noire
+
+    int tx = x + 10;
+    int ty = y + 35;
+    writeln((GFXfont *)&FiraSans, sensors[index].title, &tx, &ty, framebuffer);
+
+    tx = x + 10;
+    ty = y + 95;
+    writeln((GFXfont *)&FiraSans, state.c_str(), &tx, &ty, framebuffer);
+}
+
+void flashCell(int index) {
+    epd_poweron();
+    drawCell(index, "...", true); // Version inversée
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    delay(200); // Temps du flash
+    drawCell(index, "OK", false); // Retour normal
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+}
+
+void updateDashboard() {
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    for (int i = 0; i < 16; i++) {
+        drawCell(i, fetchSensorState(sensors[i].state_entity));
+    }
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+}
 
+// ---------- SETUP & LOOP ----------
 
+void setup() {
+    Serial.begin(115200);
     epd_init();
+    framebuffer = (uint8_t *)ps_calloc(sizeof(uint8_t), EPD_WIDTH * EPD_HEIGHT / 2);
 
-    //* Sleep wakeup must wait one second, otherwise the touch device cannot be addressed
-    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED) {
-        delay(1000);
-    }
-
+    // Initialisation Tactile S3
     Wire.begin(BOARD_SDA, BOARD_SCL);
-
-    // Assuming that the previous touch was in sleep state, wake it up
-    pinMode(TOUCH_INT, OUTPUT);
-    digitalWrite(TOUCH_INT, HIGH);
-
-    /*
-    * The touch reset pin uses hardware pull-up,
-    * and the function of setting the I2C device address cannot be used.
-    * Use scanning to obtain the touch device address.*/
-    uint8_t touchAddress = 0;
-    Wire.beginTransmission(0x14);
-    if (Wire.endTransmission() == 0) {
-        touchAddress = 0x14;
-    }
-    Wire.beginTransmission(0x5D);
-    if (Wire.endTransmission() == 0) {
-        touchAddress = 0x5D;
-    }
-    if (touchAddress == 0) {
-        while (1) {
-            Serial.println("Failed to find GT911 - check your wiring!");
-            delay(1000);
-        }
-    }
     touch.setPins(-1, TOUCH_INT);
-    if (!touch.begin(Wire, touchAddress, BOARD_SDA, BOARD_SCL )) {
-        while (1) {
-            Serial.println("Failed to find GT911 - check your wiring!");
-            delay(1000);
-        }
+    if (!touch.begin(Wire, 0x5D, BOARD_SDA, BOARD_SCL)) { // Adresse souvent 0x5D ou 0x14
+        Serial.println("GT911 non trouvé !");
     }
-    touch.setMaxCoordinates(EPD_WIDTH, EPD_HEIGHT);
+    touch.setMaxCoordinates(SCREEN_WIDTH, SCREEN_HEIGHT);
     touch.setSwapXY(true);
     touch.setMirrorXY(false, true);
 
-    Serial.println("Started Touchscreen poll...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED) delay(500);
 
-
-    epd_poweron();
-    epd_clear();
-    write_string((GFXfont *)&FiraSans, (char *)overview, &cursor_x, &cursor_y, framebuffer);
-
-    //Draw Box
-    epd_draw_rect(600, 450, 120, 60, 0, framebuffer);
-    cursor_x = 615;
-    cursor_y = 490;
-    writeln((GFXfont *)&FiraSans, "Prev", &cursor_x, &cursor_y, framebuffer);
-
-    epd_draw_rect(740, 450, 120, 60, 0, framebuffer);
-    cursor_x = 755;
-    cursor_y = 490;
-    writeln((GFXfont *)&FiraSans, "Next", &cursor_x, &cursor_y, framebuffer);
-
-    Rect_t area = {
-        .x = 160,
-        .y = 420,
-        .width = lilygo_width,
-        .height =  lilygo_height
-    };
-    epd_copy_to_framebuffer(area, (uint8_t *) lilygo_data, framebuffer);
-
-    epd_draw_rect(10, 20, EPD_WIDTH - 20, EPD_HEIGHT / 2 + 80, 0, framebuffer);
-
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-
-    epd_poweroff();
-
-
-    // Set the initial touch interval value
-    touch_loop_interval = millis() + 300;
+    updateDashboard();
 }
 
+void loop() {
+    int16_t tx, ty;
+    if (touch.getPoint(&tx, &ty)) {
+        // Déterminer la case cliquée
+        int col = tx / (SCREEN_WIDTH / GRID_COLS);
+        int row = ty / (SCREEN_HEIGHT / GRID_ROWS);
+        int index = row * GRID_COLS + col;
 
-int16_t  x, y;
-
-void loop()
-{
-
-    // Limit the touch detection interval and detect the touch status every 300ms
-    // https://github.com/Xinyuan-LilyGO/LilyGo-EPD47/issues/143
-    if (millis()  < touch_loop_interval) {
-        return;
+        if (index >= 0 && index < 16) {
+            Serial.printf("Clic sur case %d : %s\n", index, sensors[index].title);
+            flashCell(index);   // Feedback visuel
+            sendHAAction(index); // Commande HA
+            delay(500);          // Anti-rebond
+        }
     }
 
-    uint8_t touched = touch.getPoint(&x, &y);
-    if (touched) {
-        // Serial.printf("X:%d Y:%d\n", x, y);
-        if ((x > 600 && x < 720) && (y > 450 && y < 510)) {
-            state--;
-        } else if ((x > 740 && x < 860) && (y > 450 && y < 510)) {
-            state++;
-        } else {
-            return;
-        }
-        state %= 4;
-        Serial.print(millis());
-        Serial.print(":");
-        Serial.println(state);
-        epd_poweron();
-        cursor_x = 20;
-        cursor_y = 60;
-        switch (state) {
-        case 0:
-            epd_clear_area(area1);
-            write_string((GFXfont *)&FiraSans, (char *)overview, &cursor_x, &cursor_y, NULL);
-            break;
-        case 1:
-            epd_clear_area(area1);
-            write_string((GFXfont *)&FiraSans, (char *)srceen_features, &cursor_x, &cursor_y, NULL);
-            break;
-        case 2:
-            epd_clear_area(area1);
-            write_string((GFXfont *)&FiraSans, (char *)mcu_features, &cursor_x, &cursor_y, NULL);
-            break;
-        case 3:
-            delay(1000);
-            epd_clear_area(area1);
-            write_string((GFXfont *)&FiraSans, "DeepSleep", &cursor_x, &cursor_y, NULL);
-
-            // The touch interrupt uses non-RTC-IO, so the touch wake-up function cannot be used to set the touch to sleep
-            touch.sleep();
-
-            delay(5);
-
-            Wire.end();
-
-            pinMode(BOARD_SDA, OPEN_DRAIN);
-            pinMode(BOARD_SCL, OPEN_DRAIN);
-            pinMode(TOUCH_INT, OPEN_DRAIN);
-
-            epd_poweroff_all();
-
-#if defined(CONFIG_IDF_TARGET_ESP32)
-            // Set to wake up by GPIO39
-            esp_sleep_enable_ext1_wakeup(_BV(GPIO_NUM_39), ESP_EXT1_WAKEUP_ANY_LOW);
-#elif defined(CONFIG_IDF_TARGET_ESP32S3)
-            esp_sleep_enable_ext1_wakeup(_BV(GPIO_NUM_21), ESP_EXT1_WAKEUP_ANY_LOW);
-#endif
-
-
-
-            esp_deep_sleep_start();
-            break;
-        case 4:
-            break;
-        default:
-            break;
-        }
-        epd_poweroff();
+    if (millis() - lastUpdate > UPDATE_INTERVAL) {
+        lastUpdate = millis();
+        updateDashboard();
     }
-    delay(10);
 }

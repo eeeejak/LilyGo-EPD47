@@ -1,239 +1,272 @@
-/**
- * Simple Home Assistant calendar display
- * Based on LilyGo EPD47 examples, but stripped down:
- * - No web server
- * - No file upload
- * - Just fetches two HA sensors and prints them.
- */
-
 #ifndef BOARD_HAS_PSRAM
-#error "Please enable PSRAM, Arduino IDE -> Tools -> PSRAM -> OPI PSRAM"
+#error "Please enable PSRAM: Arduino IDE -> Tools -> PSRAM -> OPI PSRAM"
 #endif
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Arduino.h>
+#include <Wire.h>
 #include "epd_driver.h"
 #include "firasans.h"
-#include "secrets.h"
+#include "secrets.h" 
+#include <TouchDrvGT911.hpp>
+#include "utilities.h"
 
-// ---------- CONFIG ----------
-// WiFi (loaded from secrets.h, which is not committed to git)
-const char* ssid     = WIFI_SSID;
-const char* password = WIFI_PASSWORD;
+// ---------- CONFIGURATION DE LA GRILLE ----------
+#define GRID_COLS 4
+#define GRID_ROWS 4
+#define NUM_SENSORS (GRID_COLS * GRID_ROWS)
 
-// Home Assistant (host/port loaded from secrets.h)
-const char* HA_HOST  = HA_HOST_ADDR;   // <-- your HA IP
-const uint16_t HA_PORT = HA_PORT_NUM;
+#define SCREEN_WIDTH  960
+#define SCREEN_HEIGHT 540
+#define MARGIN 12
+#define HEADER_H 60  // Passé à 60 pour avoir des hauteurs de cases entières (540-60 = 480 / 4 = 120px)
 
-// Long-lived access token from HA (from secrets.h)
-const char* HA_TOKEN = HA_TOKEN_VALUE;
+// Timers
+const unsigned long SENSOR_INTERVAL = 1UL * 60UL * 1000UL;       // 1 minute
+const unsigned long FULL_REFRESH_INTERVAL = 30UL * 60UL * 1000UL; // 30 minutes
+unsigned long lastSensorUpdate = 0;
+unsigned long lastFullRefresh = 0;
 
-// HA entities we created
-const char* ENTITY_LINE1 = "sensor.time"; // "sensor.desk_calendar_line_1";
-const char* ENTITY_LINE2 = "sensor.time"; // "sensor.desk_calendar_line_2";
-const char* ENTITY_CLOCK = "sensor.time"; // "sensor.desk_clock_line";
+uint8_t *framebuffer = NULL;
+TouchDrvGT911 touch;
 
-// Update intervals (ms)
-const unsigned long CAL_UPDATE_INTERVAL_MS = 60UL * 60UL * 1000UL; // 1 hour
-const unsigned long CLOCK_UPDATE_INTERVAL_MS = 60UL * 1000UL;        // 1 minute
-
-// ---------- Layout (reuse from example) ----------
-const Rect_t line1Area = {
-    .x = 0,
-    .y = 387,
-    .width = 960,
-    .height = 51,
-};
-const Rect_t line2Area = {
-    .x = 0,
-    .y = 438,
-    .width = 960,
-    .height = 51,
+struct Sensor {
+    const char* title;
+    const char* state_entity;
+    const char* action_service;
+    const char* action_entity;
+    const char* sstitre;
+    const char* color;
 };
 
-const Rect_t clockArea = {
-    .x = 0,
-    .y = 330,      // adjust as needed
-    .width = 100,
-    .height = 51,
+Sensor sensors[NUM_SENSORS] = {
+    {"I'm going", "input_select.mode", "select", "out", "..OUT", ""},
+    {"Bureau", "sensor.temperature_bureau", "light/toggle", "light.bureau", "", ""},
+    {"Cuisine", "sensor.temperature_cuisine", "switch/toggle", "switch.cafetiere", "", ""},
+    {"Extérieur", "sensor.outdoor_temp", "", "", "", ""},
+    {"Good..", "sensor.humidity", "", "", "..Night !", ""},
+    {"VMC", "sensor.vmc_status", "fan/toggle", "fan.vmc", "", ""},
+    {"Solaire", "sensor.pv_power", "", "", "", ""},
+    {"Batterie", "sensor.battery_level", "", "", "", ""},
+    {"Garage", "binary_sensor.garage", "cover/toggle", "cover.garage", "", ""},
+    {"Portail", "binary_sensor.portail", "switch/toggle", "switch.portail", "", ""},
+    {"Eau", "sensor.water_meter", "", "", "", ""},
+    {"Gaz", "sensor.gas_meter", "", "", "", ""},
+    {"I'm going", "sensor.power_usage", "", "", "", ""},
+    {"Mode", "input_select.house_mode", "input_select/select_next", "input_select.house_mode", "", ""},
+    {"Alarme", "alarm_control_panel.maison", "alarm_control_panel/alarm_arm_home", "alarm_control_panel.maison", "", ""},
+    {"Refresh", "sensor.time", "homeassistant/update_entity", "sensor.time", "", ""}
 };
 
-// ---------- Globals ----------
-unsigned long lastCalUpdate   = 0;
-unsigned long lastClockUpdate = 0;
+const char* headerTitles[] = {"CLIMAT", "ÉNERGIE", "ACCÈS", "Lights"};
+String statesCache[NUM_SENSORS];
 
-// Last drawn text for change detection
-String lastClockText;
-String lastCalLine1Text;
-String lastCalLine2Text;
+// ---------- REQUÊTES ASYNCHRONES (FreeRTOS) ----------
 
-// ---------- WiFi helpers ----------
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+struct HARequest { String service; String entity; };
 
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  uint8_t tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 40) {
-    delay(500);
-    Serial.print(".");
-    tries++;
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected, IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WiFi connect failed");
-  }
+void haTask(void *pvParameters) {
+    HARequest* req = (HARequest*)pvParameters;
+    if (req->service.length() > 0) {
+        HTTPClient http;
+        String url = String("http://") + HA_HOST_ADDR + ":" + HA_PORT_NUM + "/api/services/" + req->service;
+        http.begin(url);
+        http.addHeader("Authorization", String("Bearer ") + HA_TOKEN_VALUE);
+        http.addHeader("Content-Type", "application/json");
+        http.POST("{\"entity_id\":\"" + req->entity + "\"}");
+        http.end();
+    }
+    delete req; 
+    vTaskDelete(NULL); 
 }
 
-// ---------- HA REST helper ----------
+void sendHAActionAsync(int index) {
+    if (strlen(sensors[index].action_service) == 0) return;
+    HARequest* req = new HARequest{sensors[index].action_service, sensors[index].action_entity};
+    xTaskCreate(haTask, "HA_Task", 4096, req, 1, NULL); // Lance la requête sans bloquer le code
+}
+
+// ---------- HELPERS HA ----------
+
 String fetchSensorState(const char* entity_id) {
-  connectWiFi();
-  if (WiFi.status() != WL_CONNECTED) {
-    return "WiFi error";
-  }
-
-  HTTPClient http;
-  String url = String("http://") + HA_HOST + ":" + HA_PORT + "/api/states/" + entity_id;
-
-  http.begin(url);
-  http.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
+    if (WiFi.status() != WL_CONNECTED) return "WiFi?";
+    HTTPClient http;
+    String url = String("http://") + HA_HOST_ADDR + ":" + HA_PORT_NUM + "/api/states/" + entity_id;
+    http.begin(url);
+    http.addHeader("Authorization", String("Bearer ") + HA_TOKEN_VALUE);
+    if (http.GET() == 200) {
+        JsonDocument doc;
+        deserializeJson(doc, http.getString());
+        http.end();
+        String s = doc["state"].as<String>();
+        if (s == "on") return "OUI";
+        if (s == "off") return "NON";
+        if (s == "unavailable") return "---";
+        return s;
+    }
     http.end();
-    return "HTTP " + String(httpCode);
-  }
-
-  String payload = http.getString();
-  http.end();
-
-  StaticJsonDocument<1024> doc;
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    return "JSON error";
-  }
-
-  const char* state = doc["state"];
-  if (!state) {
-    return "No state";
-  }
-
-  return String(state);
+    return "-";
 }
 
-// ---------- Drawing helpers ----------
-void drawTextInArea(const Rect_t& area, const char* text) {
-  int32_t cursor_x = area.x;
-  int32_t cursor_y = area.y + FiraSans.advance_y + FiraSans.descender;
+// ---------- DESSIN & PARTIAL REFRESH ----------
 
-  // Clear only this area (partial refresh)
-  epd_clear_area(area);
-
-  // Draw using the same font + function the example uses
-  writeln((GFXfont *)&FiraSans, text, &cursor_x, &cursor_y, NULL);
+// Calcule la zone exacte d'un bouton
+Rect_t getCellArea(int index) {
+    int cellW = SCREEN_WIDTH / GRID_COLS;
+    int cellH = (SCREEN_HEIGHT - HEADER_H) / GRID_ROWS;
+    int col = index % GRID_COLS;
+    int row = index / GRID_COLS;
+    return (Rect_t){ .x = col * cellW, .y = HEADER_H + (row * cellH), .width = cellW, .height = cellH };
 }
 
-void drawInitialScreen() {
-  // One-time full clear on boot so the panel starts in a known state
-  epd_poweron();
-  epd_clear();
-  epd_poweroff();
+void drawHeaderToBuffer() {
+    epd_fill_rect(0, 0, SCREEN_WIDTH, HEADER_H, 0xDD, framebuffer); // Gris clair
+    epd_draw_line(0, HEADER_H-1, SCREEN_WIDTH, HEADER_H-1, 0, framebuffer);
+
+    int sectionW = SCREEN_WIDTH / GRID_COLS;
+    for (int i = 0; i < GRID_COLS; i++) {
+        int tx = (i * sectionW) + (sectionW / 4) - 10;
+        int ty = 40;
+        String title = (i < (sizeof(headerTitles)/sizeof(headerTitles[0]))) ? headerTitles[i] : "ZONE";
+        writeln((GFXfont *)&FiraSans, title.c_str(), &tx, &ty, framebuffer);
+        if (i > 0) epd_draw_line(i * sectionW, 0, i * sectionW, HEADER_H, 0, framebuffer);
+    }
 }
 
-void drawCalendarScreen(const String& clock, const String& line1, const String& line2) {
-  // If nothing changed, don’t bother redrawing this set
-  if (clock == lastClockText && line1 == lastCalLine1Text && line2 == lastCalLine2Text) {
-    return;
-  }
+void drawCellToBuffer(int index, String state, bool inverted = false) {
+    Rect_t area = getCellArea(index);
+    
+    // Nettoyage précis de la case dans le buffer
+    uint8_t bg = inverted ? 0x00 : 0xFF; 
+    epd_fill_rect(area.x, area.y, area.width, area.height, bg, framebuffer);
+    
+    // Bordure
+    int w = area.width - MARGIN;
+    int h = area.height - MARGIN;
+    int cx = area.x + (MARGIN / 2);
+    int cy = area.y + (MARGIN / 2);
+    epd_draw_rect(cx, cy, w, h, 0, framebuffer);
 
-  lastClockText    = clock;
-  lastCalLine1Text = line1;
-  lastCalLine2Text = line2;
+    // Titre (en gris 0x66 si non cliqué)
+    int tx = cx + 10;
+    int ty = cy + 35;
+    writeln((GFXfont *)&FiraSans, sensors[index].title, &tx, &ty, framebuffer);
 
-  epd_poweron();
-
-  // Clock line (partial refresh)
-  drawTextInArea(clockArea, clock.c_str());
-
-  // Time line (partial refresh)
-  drawTextInArea(line1Area, line1.c_str());
-
-  // Title line (partial refresh)
-  drawTextInArea(line2Area, line2.c_str());
-
-  epd_poweroff();
+    // Valeur
+    tx = cx + 15;
+    ty = cy + 90;
+    writeln((GFXfont *)&FiraSans, state.c_str(), &tx, &ty, framebuffer);
 }
 
-// Clock-only partial refresh
-void drawClockOnly(const String& clock) {
-  // Skip if the clock text hasn’t changed
-  if (clock == lastClockText) {
-    return;
-  }
-
-  lastClockText = clock;
-
-  epd_poweron();
-  drawTextInArea(clockArea, clock.c_str());
-  epd_poweroff();
+// Envoie UNIQUEMENT la zone du bouton à l'écran (Partial Refresh ciblé)
+void pushCellToScreen(int index) {
+    epd_poweron();
+    epd_draw_grayscale_image(getCellArea(index), framebuffer);
+    epd_poweroff();
 }
 
-// ---------- Arduino lifecycle ----------
+// ---------- LOGIQUE DE MISE À JOUR ----------
+
+// Le gros refresh qui nettoie l'écran (toutes les 30 min)
+void performFullRefresh() {
+    Serial.println("[TIMER] Full Screen Refresh (30 min)");
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    drawHeaderToBuffer();
+    
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        statesCache[i] = fetchSensorState(sensors[i].state_entity);
+        drawCellToBuffer(i, statesCache[i], false);
+    }
+    
+    epd_poweron();
+    epd_clear(); // Nettoyage physique de la dalle e-ink
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+    
+    lastFullRefresh = millis();
+    lastSensorUpdate = millis();
+}
+
+// Le petit refresh qui vérifie les états (toutes les minutes)
+void performSensorUpdate() {
+    Serial.println("[TIMER] Sensor Data Update (1 min)");
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        String newState = fetchSensorState(sensors[i].state_entity);
+        if (newState != statesCache[i]) {
+            statesCache[i] = newState;
+            drawCellToBuffer(i, newState, false);
+            pushCellToScreen(i); // Met à jour uniquement la case concernée
+        }
+    }
+    lastSensorUpdate = millis();
+}
+
+// ---------- GESTION TACTILE ----------
+
+void handleTouch(int16_t tx, int16_t ty) {
+    if (ty < HEADER_H) return; // Ignore le bandeau gris
+
+    int col = tx / (SCREEN_WIDTH / GRID_COLS);
+    int row = (ty - HEADER_H) / ((SCREEN_HEIGHT - HEADER_H) / GRID_ROWS);
+    int index = row * GRID_COLS + col;
+
+    if (index >= 0 && index < NUM_SENSORS) {
+        Serial.printf("Clic sur le bouton %d\n", index);
+
+        // 1. Affiche le bouton en NOIR (Partial refresh immédiat)
+        drawCellToBuffer(index, "...", true);
+        pushCellToScreen(index);
+
+        // 2. Envoie la requête HA en arrière-plan (non bloquant)
+        sendHAActionAsync(index);
+
+        // 3. Attend exactement 1 seconde
+        delay(1000);
+
+        // 4. Récupère le nouvel état, remet en blanc, et push à l'écran
+        statesCache[index] = fetchSensorState(sensors[index].state_entity);
+        drawCellToBuffer(index, statesCache[index], false);
+        pushCellToScreen(index);
+    }
+}
+
+// ---------- ARDUINO ----------
+
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("\nEPD47 Home Assistant Calendar");
+    Serial.begin(115200);
+    epd_init();
+    framebuffer = (uint8_t *)ps_calloc(sizeof(uint8_t), EPD_WIDTH * EPD_HEIGHT / 2);
+    
+    Wire.begin(BOARD_SDA, BOARD_SCL);
+    touch.setPins(-1, TOUCH_INT);
+    if (touch.begin(Wire, 0x5D, BOARD_SDA, BOARD_SCL)) {
+        touch.setMaxCoordinates(SCREEN_WIDTH, SCREEN_HEIGHT);
+        touch.setSwapXY(true);
+        touch.setMirrorXY(false, true);
+    }
 
-  // Init display
-  epd_init();
-  // One-time clear
-  drawInitialScreen();
-
-  // Initial WiFi connect
-  connectWiFi();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED) delay(500);
+    
+    performFullRefresh(); // Premier affichage
 }
 
 void loop() {
-  unsigned long now = millis();
+    int16_t tx, ty;
+    if (touch.getPoint(&tx, &ty)) {
+        handleTouch(tx, ty);
+    }
 
-  // Calendar + event + clock (full set) every CAL_UPDATE_INTERVAL_MS
-  if (lastCalUpdate == 0 || (now - lastCalUpdate) > CAL_UPDATE_INTERVAL_MS) {
-    lastCalUpdate = now;
+    unsigned long currentMillis = millis();
 
-    String clock = fetchSensorState(ENTITY_CLOCK);
-    String l1    = fetchSensorState(ENTITY_LINE1);
-    String l2    = fetchSensorState(ENTITY_LINE2);
+    if (currentMillis - lastFullRefresh >= FULL_REFRESH_INTERVAL) {
+        performFullRefresh();
+    } 
+    else if (currentMillis - lastSensorUpdate >= SENSOR_INTERVAL) {
+        performSensorUpdate();
+    }
 
-    Serial.println("[HA] FULL Clock: " + clock);
-    Serial.println("[HA] FULL Line1: " + l1);
-    Serial.println("[HA] FULL Line2: " + l2);
-
-    drawCalendarScreen(clock, l1, l2);
-
-    // We also just updated the clock
-    lastClockUpdate = now;
-  }
-
-  // Clock-only update every CLOCK_UPDATE_INTERVAL_MS
-  if (lastClockUpdate == 0 || (now - lastClockUpdate) > CLOCK_UPDATE_INTERVAL_MS) {
-    lastClockUpdate = now;
-
-    String clock = fetchSensorState(ENTITY_CLOCK);
-    Serial.println("[HA] CLOCK-ONLY: " + clock);
-
-    drawClockOnly(clock);
-  }
-
-  delay(1000);
+    delay(20); 
 }
